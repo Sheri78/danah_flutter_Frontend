@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "944262289615",
+    "project_id": "hmwapp-9e46b",
+    "storage_bucket": "hmwapp-9e46b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:944262289615:android:d8b3b1dfdbea535381ffba",
+        "android_client_info": {
+          "package_name": "com.example.flutter_application_hmw"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDe562pitNLHcGG27dwvIbIo1CXz2J0lc4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
