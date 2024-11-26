@@ -1036,7 +1036,7 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> uploadAudio(String filePath) async {
     final file = File(filePath);
-    final uri = Uri.parse('http://192.168.10.5:5000/process-audio');
+    final uri = Uri.parse('http://192.168.237.94:5000/process-audio');
 
     var request = http.MultipartRequest('POST', uri)
       ..files.add(await http.MultipartFile.fromPath('audio', file.path));
@@ -1077,7 +1077,7 @@ class _ChatPageState extends State<ChatPage> {
       // Prepare and send the HTTP request
       var request = http.MultipartRequest(
         'POST',
-        Uri.parse('http://192.168.10.5:5000/process-audio'),
+        Uri.parse('http://192.168.237.94:5000/process-audio'),
       );
       request.files.add(await http.MultipartFile.fromPath('audio', filePath));
 
