@@ -6,11 +6,14 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'dart:io';
-import 'package:path_provider/path_provider.dart';
-import 'package:audioplayers/audioplayers.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:async';
+import 'dart:io';
+import 'package:just_audio/just_audio.dart' as just_audio;
+import 'package:http_parser/http_parser.dart';
+import 'package:path_provider/path_provider.dart';
+FlutterSoundRecorder recorder = FlutterSoundRecorder();
 
 
 
@@ -957,6 +960,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
   }
 }
 
+
+
 class ChatPage extends StatefulWidget {
   final String username;
 
@@ -968,108 +973,157 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
+  final FlutterSoundPlayer _player = FlutterSoundPlayer();
   final List<Map<String, String>> _messages = [];
   final TextEditingController _messageController = TextEditingController();
-  final AudioPlayer _audioPlayer = AudioPlayer();
 
-  bool _isRecording = false;
-  bool isUploading = false;
-  double uploadProgress = 0.0;
-
+  bool _isInitialized = false; // Tracks recorder/player initialization
+  bool _isRecording = false; // Tracks recording state
 
   @override
   void initState() {
     super.initState();
-    _initializeRecorder();
+    _initializeAudioComponents();
   }
 
-  @override
-  void dispose() {
-    _recorder.closeRecorder();
-    _audioPlayer.dispose();
-    super.dispose();
-  }
+  Future<void> _initializeAudioComponents() async {
+    try {
+      final micPermission = await Permission.microphone.request();
+      if (!micPermission.isGranted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Microphone permission is required.")),
+        );
+        return;
+      }
 
-  Future<void> _initializeRecorder() async {
-    final micPermission = await Permission.microphone.request();
-    if (micPermission.isGranted) {
       await _recorder.openRecorder();
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Microphone permission is required.")),
-      );
+      await _player.openPlayer();
+      setState(() {
+        _isInitialized = true;
+      });
+    } catch (e) {
+      print("Error initializing recorder/player: $e");
     }
   }
 
-  Future<void> _startRecording() async {
-    if (!_recorder.isRecording) {
-      await _recorder.startRecorder(toFile: 'temp.wav');
+  Future<void> startRecording() async {
+    await _recorder.startRecorder(toFile: 'audio_message.aac');
+    setState(() {
+      _isRecording = true;
+    });
+  }
+
+  Future<String?> stopRecording() async {
+    if (_isRecording) {
+      final path = await _recorder.stopRecorder();
       setState(() {
-        _isRecording = true;
+        _isRecording = false;
       });
+
+      if (path != null) {
+        final originalFile = File(path);
+        final wavFilePath = path.replaceAll('.aac', '.wav');
+        final wavFile = File(wavFilePath);
+
+        // Rename or convert the file to .wav
+        await originalFile.rename(wavFile.path);
+        print("File converted to WAV: $wavFilePath");
+        return wavFile.path;
+      }
+    }
+    return null;
+  }
+
+  Future<void> uploadAudio(String filePath) async {
+    final file = File(filePath);
+    final uri = Uri.parse('http://192.168.10.5:5000/process-audio');
+
+    var request = http.MultipartRequest('POST', uri)
+      ..files.add(await http.MultipartFile.fromPath('audio', file.path));
+
+    final response = await request.send();
+
+    if (response.statusCode == 200) {
+      print('Audio uploaded successfully');
+    } else {
+      print('Failed to upload audio');
+    }
+  }
+
+  Future<void> _playRecording(String filePath) async {
+    try {
+      await _player.startPlayer(fromURI: filePath);
+      print('Playing recording from: $filePath');
+    } catch (e) {
+      print('Error during playback: $e');
     }
   }
 
   Future<void> processAudio(String filePath) async {
-  try {
-    setState(() {
-      isUploading = true; // Start showing progress
-      uploadProgress = 0.0; // Reset progress
-    });
+    try {
+      // Check if the file exists locally
+      File file = File(filePath);
+      if (!file.existsSync()) {
+        print("File does not exist at: $filePath");
+        setState(() {
+          _messages.add({
+            "type": "error",
+            "content": "Error: File does not exist locally."
+          });
+        });
+        return;
+      }
 
-    var request = http.MultipartRequest('POST', Uri.parse('http://10.0.2.2:5000/process-audio'));
-    request.files.add(await http.MultipartFile.fromPath('audio', filePath));
+      // Prepare and send the HTTP request
+      var request = http.MultipartRequest(
+        'POST',
+        Uri.parse('http://192.168.10.5:5000/process-audio'),
+      );
+      request.files.add(await http.MultipartFile.fromPath('audio', filePath));
 
-    // Send the request and handle response
-    var response = await request.send();
-    if (response.statusCode == 200) {
-      var responseData = await http.Response.fromStream(response);
-      var data = jsonDecode(responseData.body);
+      var response = await request.send();
 
+      if (response.statusCode == 200) {
+        var responseData = await http.Response.fromStream(response);
+        var data = jsonDecode(responseData.body);
+
+        // Check if emotion exists in the response
+        if (data.containsKey("emotion")) {
+          setState(() {
+            _messages.add({
+              "type": "voice",
+              "content": filePath,
+              "text": data["transcription"] ?? "",
+              "emotion": data["emotion"],
+            });
+          });
+        } else {
+          setState(() {
+            _messages.add({
+              "type": "error",
+              "content": "Error: Emotion data missing in server response."
+            });
+          });
+        }
+      } else {
+        print("Server error: ${response.statusCode}");
+        setState(() {
+          _messages.add({
+            "type": "error",
+            "content": "Server Error: ${response.reasonPhrase}"
+          });
+        });
+      }
+    } catch (e) {
+      print("Exception during audio processing: $e");
       setState(() {
         _messages.add({
-          "type": "voice",
-          "content": filePath,
-          "text": data["text"],
-          "emotion": data["emotion"],
+          "type": "error",
+          "content": "Exception: Failed to process audio."
         });
-        uploadProgress = 1.0; // Upload complete
       });
-    } else {
-      var errorResponse = await http.Response.fromStream(response);
-      print("Error response: ${errorResponse.body}");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Error uploading audio: ${errorResponse.body}")),
-      );
-    }
-  } catch (e) {
-    print("Error processing audio: $e");
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text("Failed to upload audio: $e")),
-    );
-  } finally {
-    setState(() {
-      isUploading = false; // Stop showing progress
-    });
-  }
-}
-
-
-
-  Future<void> _stopRecording() async {
-  if (_recorder.isRecording) {
-    final tempPath = await _recorder.stopRecorder();
-    final appDir = await getApplicationDocumentsDirectory();
-
-    if (tempPath != null) {
-      final savedPath = "${appDir.path}/voice_message_${DateTime.now().millisecondsSinceEpoch}.wav";
-      await File(tempPath).copy(savedPath);
-      await processAudio(savedPath); // Call the backend
     }
   }
-}
-
-
 
   void _sendMessage() {
     if (_messageController.text.trim().isNotEmpty) {
@@ -1080,6 +1134,120 @@ class _ChatPageState extends State<ChatPage> {
         });
       });
       _messageController.clear();
+    }
+  }
+
+  Widget _buildMessage(Map<String, String> message) {
+    final messageType = message["type"];
+    if (messageType == "text") {
+      return Align(
+        alignment: Alignment.centerRight,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 10),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: Colors.blue,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            message["content"]!,
+            style: const TextStyle(color: Colors.white),
+          ),
+        ),
+      );
+    } else if (messageType == "voice") {
+      final emotionColor = _getEmotionColor(message["emotion"]!);
+      final emotionEmoji = _getEmotionEmoji(message["emotion"]!);
+
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 10),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            border: Border.all(color: emotionColor, width: 2),
+            borderRadius: BorderRadius.circular(10),
+            color: Colors.white,
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                "Transcription: ${message["text"] ?? ""}",
+                style: const TextStyle(fontSize: 16),
+              ),
+              Row(
+                children: [
+                  Icon(Icons.emoji_emotions, color: emotionColor),
+                  const SizedBox(width: 5),
+                  Text(
+                    emotionEmoji,
+                    style: const TextStyle(fontSize: 20),
+                  ),
+                ],
+              ),
+              VoiceMessageWidget(
+                filePath: message["content"]!,
+                emotion: message["emotion"]!,
+                playCallback: () => _playRecording(message["content"]!),
+              ),
+            ],
+          ),
+        ),
+      );
+    } else if (messageType == "error") {
+      return Align(
+        alignment: Alignment.center,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 10),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: Colors.redAccent,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            message["content"] ?? "An error occurred",
+            style: const TextStyle(color: Colors.white),
+          ),
+        ),
+      );
+    } else {
+      return Align(
+        alignment: Alignment.center,
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 10),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: Colors.grey,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            "Unknown message type",
+            style: const TextStyle(color: Colors.white),
+          ),
+        ),
+      );
+    }
+  }
+
+  String _getEmotionEmoji(String emotion) {
+    switch (emotion) {
+      case "happy":
+        return "😊";
+      case "angry":
+        return "😡";
+      case "sad":
+        return "😢";
+      case "calm":
+        return "😌";
+      case "disgust":
+        return "🤢";
+      case "fear":
+        return "😱";
+      case "surprise":
+        return "😲";
+      default:
+        return "😶";
     }
   }
 
@@ -1095,246 +1263,121 @@ class _ChatPageState extends State<ChatPage> {
         return Colors.green;
       case "disgust":
         return Colors.purple;
+      case "fear":
+        return Colors.black;
+      case "surprise":
+        return Colors.orange;
       default:
         return Colors.grey;
     }
   }
 
-  Widget _buildMessage(Map<String, String> message) {
-  final isText = message["type"] == "text";
-  if (isText) {
-    return Align(
-      alignment: Alignment.centerRight,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 10),
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(
-          color: Colors.blue,
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Text(
-          message["content"]!,
-          style: const TextStyle(color: Colors.white),
-        ),
-      ),
-    );
-  } else {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text("Transcription: ${message["text"] ?? ""}", style: TextStyle(fontSize: 16)),
-          VoiceMessageWidget(
-            filePath: message["content"]!,
-            emotion: message["emotion"] ?? "neutral",
-          ),
-        ],
-      ),
-    );
-  }
-}
-@override
-Widget build(BuildContext context) {
-  return Scaffold(
-    appBar: AppBar(title: Text(widget.username)),
-    body: Stack(
-      children: [
-        Column(
-          children: [
-            Expanded(
-              child: ListView.builder(
-                reverse: true,
-                itemCount: _messages.length,
-                itemBuilder: (context, index) {
-                  return _buildMessage(_messages[_messages.length - 1 - index]);
-                },
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Row(
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.add),
-                    onPressed: () {},
-                  ),
-                  Expanded(
-                    child: TextField(
-                      controller: _messageController,
-                      decoration: InputDecoration(
-                        hintText: "Type a message",
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.send),
-                    onPressed: _sendMessage,
-                  ),
-                  GestureDetector(
-                    onLongPress: _startRecording,
-                    onLongPressUp: _stopRecording,
-                    child: Icon(
-                      Icons.mic,
-                      color: _isRecording ? Colors.red : Colors.blue,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        if (isUploading)
-          Positioned(
-            bottom: 80,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircularProgressIndicator(
-                    value: uploadProgress,
-                    color: Colors.blue,
-                  ),
-                  SizedBox(height: 10),
-                  Text(
-                    "Uploading voice message...",
-                    style: TextStyle(fontSize: 16, color: Colors.grey),
-                  ),
-                ],
-              ),
-            ),
-          ),
-      ],
-    ),
-  );
-}
-
-
-}
-
-class VoiceMessageWidget extends StatefulWidget {
-  final String filePath;
-  final String emotion;
-
-  const VoiceMessageWidget({super.key, required this.filePath, required this.emotion});
-
-  @override
-  _VoiceMessageWidgetState createState() => _VoiceMessageWidgetState();
-}
-
-class _VoiceMessageWidgetState extends State<VoiceMessageWidget> {
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  Duration _duration = Duration.zero;
-  Duration _position = Duration.zero;
-  bool _isPlaying = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _initializeAudioPlayer();
-  }
-
-  Future<void> _initializeAudioPlayer() async {
-    try {
-      await _audioPlayer.setSource(DeviceFileSource(widget.filePath));
-      _audioPlayer.onDurationChanged.listen((duration) {
-        setState(() {
-          _duration = duration;
-        });
-      });
-      _audioPlayer.onPositionChanged.listen((position) {
-        setState(() {
-          _position = position;
-        });
-      });
-      _audioPlayer.onPlayerComplete.listen((_) {
-        setState(() {
-          _isPlaying = false;
-          _position = Duration.zero;
-        });
-      });
-    } catch (e) {
-      print("Error initializing audio player: $e");
-    }
-  }
-
   @override
   void dispose() {
-    _audioPlayer.dispose();
+    _recorder.closeRecorder();
+    _player.closePlayer();
     super.dispose();
-  }
-
-  String _formatDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, "0");
-    final minutes = twoDigits(duration.inMinutes);
-    final seconds = twoDigits(duration.inSeconds.remainder(60));
-    return "$minutes:$seconds";
   }
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 5, horizontal: 10),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        border: Border.all(color: Colors.yellow, width: 2),
-        borderRadius: BorderRadius.circular(10),
-        color: Colors.white,
-      ),
-      child: Row(
-        children: [
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.username),
+        actions: [
           IconButton(
-            icon: Icon(
-              _isPlaying ? Icons.pause : Icons.play_arrow,
-              color: Colors.blue,
-            ),
-            onPressed: () async {
-              if (_isPlaying) {
-                await _audioPlayer.pause();
-              } else {
-                await _audioPlayer.resume();
-              }
-              setState(() {
-                _isPlaying = !_isPlaying;
-              });
+            icon: const Icon(Icons.settings),
+            onPressed: () {
+              // Navigate to settings page
             },
           ),
+        ],
+      ),
+      body: Column(
+        children: [
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            child: ListView.builder(
+              itemCount: _messages.length,
+              itemBuilder: (context, index) {
+                return _buildMessage(_messages[index]);
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(10.0),
+            child: Row(
               children: [
-                Slider(
-                  value: _position.inSeconds.toDouble(),
-                  max: _duration.inSeconds.toDouble(),
-                  onChanged: (value) async {
-                    await _audioPlayer.seek(Duration(seconds: value.toInt()));
-                  },
-                  activeColor: Colors.blue,
-                  inactiveColor: Colors.grey,
+                Expanded(
+                  child: TextField(
+                    controller: _messageController,
+                    decoration: const InputDecoration(
+                      hintText: 'Type a message...',
+                      border: OutlineInputBorder(),
+                    ),
+                    onSubmitted: (value) => _sendMessage(),
+                  ),
                 ),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      _formatDuration(_position),
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    Text(
-                      _formatDuration(_duration),
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                  ],
+                const SizedBox(width: 10),
+                IconButton(
+                  icon: Icon(
+                    _isRecording ? Icons.stop : Icons.mic,
+                    color: _isRecording ? Colors.red : Colors.blue,
+                  ),
+                  onPressed: _isRecording ? () async {
+                    final path = await stopRecording();
+                    if (path != null) {
+                      processAudio(path);
+                    }
+                  } : startRecording,
+                ),
+                const SizedBox(width: 10),
+                ElevatedButton(
+                  onPressed: _sendMessage,
+                  child: const Text('Send'),
                 ),
               ],
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+class VoiceMessageWidget extends StatelessWidget {
+  final String filePath;
+  final String emotion;
+  final VoidCallback playCallback;
+
+  const VoiceMessageWidget({
+    Key? key,
+    required this.filePath,
+    required this.emotion,
+    required this.playCallback,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        IconButton(
+          icon: const Icon(Icons.play_arrow),
+          onPressed: playCallback,
+        ),
+        Expanded(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.grey),
+            ),
+            child: Text(
+              'Voice Message ($emotion)',
+              style: const TextStyle(fontSize: 16),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
